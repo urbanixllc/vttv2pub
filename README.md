@@ -8,6 +8,7 @@ means something.
 |---|---|
 | [`verify-proof.mjs`](verify-proof.mjs) | Checks a VesTally proof file against your copy of the file and against BNB Chain, with no VesTally servers. One file, no dependencies. |
 | [`witness/`](witness/) | Runs a VesTally Blockchain Ledger witness on your own computer: keeps a full copy, checks every block, co-signs it. |
+| [`anchor-action/`](anchor-action/) | Anchor my code: a GitHub Action that puts each release (its commit and files) on the public record. Use `urbanixllc/vttv2pub/anchor-action@v1`. |
 | [`contracts/RecordAnchor.sol`](contracts/RecordAnchor.sol) | The contract the daily records are published to on BNB Chain. No owner, no storage, no funds. |
 
 ## Check a seal without VesTally
