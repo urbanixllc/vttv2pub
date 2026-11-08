@@ -1,0 +1,7 @@
+# Never commit a witness key or a witness's Ledger copy.
+witness-key.json
+witness-data/
+node_modules/
+.env
+.env.*
+*.pem

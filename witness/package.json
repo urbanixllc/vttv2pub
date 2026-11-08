@@ -1,0 +1,8 @@
+{
+  "name": "vestally-witness",
+  "private": true,
+  "type": "module",
+  "description": "Run a VesTally Blockchain Ledger community witness on your own computer.",
+  "scripts": { "start": "node witness.mjs run" },
+  "dependencies": { "viem": "2.21.55" }
+}
