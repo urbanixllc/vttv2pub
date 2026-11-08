@@ -1,5 +1,5 @@
 name: VesTally Anchor my code
-description: Put each release (its commit and files) on the VesTally public record on BNB Chain. Free, no sign-up, no API key.
+description: "Put each release (its commit and files) on the VesTally public record on BNB Chain. Free, no sign-up, no API key."
 author: VesTally
 branding:
   icon: anchor
@@ -7,28 +7,28 @@ branding:
 
 inputs:
   files:
-    description: Files to seal, one glob per line (for example `dist/*.zip`). Their SHA-256 codes are sent; the files never are.
+    description: "Files to seal, one glob per line (for example `dist/*.zip`). Their SHA-256 codes are sent; the files never are."
     required: false
     default: ""
   release-assets:
-    description: Also seal the assets attached to the release this workflow runs for (needs `contents: read`).
+    description: "Also seal the assets attached to the release this workflow runs for (needs `contents: read`)."
     required: false
     default: "true"
   api-url:
-    description: VesTally API base URL.
+    description: "VesTally API base URL."
     required: false
     default: https://vestallytoken.io/api
   site-url:
-    description: VesTally site, used for the check links in the job summary.
+    description: "VesTally site, used for the check links in the job summary."
     required: false
     default: https://vestallytoken.io
 
 outputs:
   commit-code:
-    description: The seal code for this commit.
+    description: "The seal code for this commit."
     value: ${{ steps.anchor.outputs.commit-code }}
   check-url:
-    description: Link anyone can open to check this commit on the public record.
+    description: "Link anyone can open to check this commit on the public record."
     value: ${{ steps.anchor.outputs.check-url }}
 
 runs:
