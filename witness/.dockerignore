@@ -1,0 +1,4 @@
+node_modules
+witness-data
+witness-key.json
+.env

@@ -1,0 +1,23 @@
+# Run a VesTally witness with Docker:
+#   1. Put your public name in a file called .env next to this one:  WITNESS_LABEL=Your name
+#   2. docker compose up -d
+# Your key and your copy of the Ledger are kept in the "witness-data" volume. Back the key up with:
+#   docker compose cp witness:/data/witness-key.json ./witness-key-backup.json
+services:
+  witness:
+    build: .
+    image: vestally-witness
+    restart: unless-stopped
+    init: true
+    environment:
+      WITNESS_SITE: https://vestallytoken.io
+      # The Ledger's signing address, as shown on vestallytoken.io/ledger. Blocks signed by anyone else are refused.
+      WITNESS_SEQUENCER: "0x762613AE6F8dcFf2d2e35e0d39B56d42dfDfAEdf"
+      WITNESS_LABEL: ${WITNESS_LABEL:?Put WITNESS_LABEL=Your name in a .env file next to docker-compose.yml}
+    volumes:
+      - witness-data:/data
+    mem_limit: 256m
+    logging:
+      options: { max-size: "5m", max-file: "2" }
+volumes:
+  witness-data:

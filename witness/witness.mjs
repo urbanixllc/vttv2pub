@@ -28,6 +28,8 @@ import { join } from "node:path";
 import { bytesToHex, concat, encodeAbiParameters, getAddress, keccak256, recoverMessageAddress, stringToBytes } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 
+/** Shown at startup; README and the Ledger page say which is current. */
+export const VERSION = "2026.11.10";
 const KEY_FILE = "witness-key.json";
 const DATA = "witness-data";
 const GENESIS_PREV = `0x${"00".repeat(32)}`;
@@ -147,16 +149,18 @@ async function sendRequest(site, account, label) {
 }
 
 async function run() {
-  const site = arg("site");
-  const sequencer = arg("sequencer");
-  const label = arg("label");
-  if (!site || !/^0x[0-9a-fA-F]{40}$/.test(sequencer ?? "")) {
-    console.log('Usage: node witness.mjs run --site <https://…> --sequencer <0x… address shown on the Ledger page> --label "Your name"');
+  // Settings come from the command line, or from WITNESS_* environment variables (handy for Docker).
+  const site = arg("site") ?? process.env.WITNESS_SITE ?? "https://vestallytoken.io";
+  const sequencer = arg("sequencer") ?? process.env.WITNESS_SEQUENCER;
+  const label = arg("label") ?? process.env.WITNESS_LABEL;
+  if (!/^0x[0-9a-fA-F]{40}$/.test(sequencer ?? "")) {
+    console.log('Usage: node witness.mjs run --sequencer <0x… address shown on the Ledger page> --label "Your name" [--site https://vestallytoken.io]');
     process.exit(2);
   }
+  console.log(`VesTally witness ${VERSION}`);
   if (!existsSync(KEY_FILE)) {
-    console.log("No witness key yet. Run: node witness.mjs init");
-    process.exit(2);
+    console.log("No witness key yet, so making one now.");
+    init();
   }
   const account = privateKeyToAccount(JSON.parse(readFileSync(KEY_FILE, "utf8")).privateKey);
   mkdirSync(DATA, { recursive: true });
@@ -346,12 +350,16 @@ function init() {
   writeFileSync(KEY_FILE, JSON.stringify({ privateKey, note: "VesTally witness key. Keep it on this computer. Never send it to anyone." }, null, 2), { mode: 0o600 });
   console.log(`Witness key created in ${KEY_FILE} (keep it private and backed up).`);
   console.log(`Your witness address: ${privateKeyToAccount(privateKey).address}`);
-  console.log('Next: node witness.mjs run --site <site> --sequencer <address> --label "Your name". It asks to join for you.');
+  if (process.argv[2] === "init") console.log('Next: node witness.mjs run --sequencer <address> --label "Your name". It asks to join for you.');
 }
 
 const cmd = process.argv[2];
 if (process.argv[1]?.replace(/\\/g, "/").endsWith("witness.mjs")) {
+  // Stop cleanly when asked (Docker, systemd, Task Scheduler). Every write is complete or atomic.
+  process.on("SIGTERM", () => process.exit(0));
+  process.on("SIGINT", () => process.exit(0));
   if (cmd === "init") init();
   else if (cmd === "run") await run();
-  else console.log('Commands: init | run --site <url> --sequencer <address> --label "Your name"');
+  else if (cmd === "version") console.log(VERSION);
+  else console.log('Commands: init | run --sequencer <address> --label "Your name" [--site <url>] | version');
 }
