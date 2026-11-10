@@ -32,6 +32,32 @@ export const BEACON_MAX_GAP = 10_000;
 /** Reveals in a witness's chain: years of bingo nights. A new chain starts itself when one runs low. */
 export const BEACON_CHAIN_LENGTH = 100_000;
 const ZERO = `0x${"00".repeat(32)}` as Hex;
+const SELECT_DOMAIN = keccak256(stringToBytes("VesTally Blockchain Ledger beacon selection v1"));
+
+/**
+ * Most witnesses one random number waits for. With more ready witnesses than this, each request
+ * picks this many, so a growing witness pool never slows random numbers down. One honest
+ * contributor is enough for an unpredictable number, so five is plenty.
+ */
+export const BEACON_MAX_WITNESSES = 5;
+
+/**
+ * The witnesses a request waits for, from those ready to reveal. Up to BEACON_MAX_WITNESSES: all of
+ * them; beyond that, the ones whose keccak(domain, seed, height, witness) is lowest. The seed is the
+ * previous random number (or, before the first, the request block's parent hash), which the
+ * witnesses helped make, so VesTally can't steer who is picked without changing a published random
+ * number. Anyone can recompute it from the beacon's recorded seed and candidates.
+ */
+export function beaconSelection(candidates: readonly Address[], seed: Hex, height: number, max = BEACON_MAX_WITNESSES): Address[] {
+  const all = [...new Set(candidates.map((w) => w.toLowerCase() as Address))];
+  if (all.length <= max) return all.sort();
+  return all
+    .map((w) => ({ w, rank: keccak256(encodeAbiParameters([{ type: "bytes32" }, { type: "bytes32" }, { type: "uint64" }, { type: "address" }], [SELECT_DOMAIN, seed, BigInt(height), getAddress(w)])) }))
+    .sort((a, b) => (a.rank < b.rank ? -1 : a.rank > b.rank ? 1 : 0))
+    .slice(0, max)
+    .map((x) => x.w)
+    .sort();
+}
 
 export interface BeaconReveal {
   witness: Address;
@@ -59,6 +85,11 @@ export interface Beacon {
   reveals: BeaconReveal[];
   /** The sequencer's secret, published when the beacon closes. Its hash is the request block's kind-18 record. Absent on v1 beacons. */
   secret?: Hex;
+  /**
+   * Only when more witnesses were ready than BEACON_MAX_WITNESSES: who was ready, the seed, and who
+   * was picked (beaconSelection). Not part of the value; recorded so anyone can recheck the pick.
+   */
+  selection?: { candidates: Address[]; seed: Hex; picked: Address[] };
   value: Hex;
 }
 
