@@ -1,0 +1,7 @@
+{
+  "name": "vestally-verify-receipt",
+  "private": true,
+  "type": "module",
+  "description": "Check VesTally for Business receipts (FairSelect, RecordProof) with no VesTally servers.",
+  "dependencies": { "viem": "2.21.55" }
+}

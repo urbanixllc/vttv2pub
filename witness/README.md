@@ -15,7 +15,7 @@ Every random-number contribution VesTally accepts comes back with a signed recei
 `witness-data/receipts.jsonl`. If one were ever left out, your witness prints an alert with the
 receipt, which proves it to anyone.
 
-It's a small program: about 25 MB of memory and almost no CPU. If your computer is off, it catches
+It's a small program: about 40 MB of memory and almost no CPU. If your computer is off, it catches
 up when it's back; the Ledger never waits for you.
 
 You need two things:
@@ -212,6 +212,8 @@ this repository. Updating keeps your key, your copy of the Ledger and your rando
 Your witness also helps make random numbers nobody can predict, such as the balls in charity bingo
 games. On first run it makes a secret chain of values in `witness-data/beacon.json` and publishes
 only a fingerprint of it. Whenever the Ledger asks for a random number, it adds the next value.
+When more than five witnesses are ready, five are picked for each number; the others are told
+they were skipped this time, which isn't an error.
 Nobody else knows that value in advance, so nobody, VesTally included, can see the number coming.
 There's nothing to set up. It costs a few bytes per request, and during a game the program checks
 every second instead of every 3. If your contribution is ever left out, it prints an ALERT.
