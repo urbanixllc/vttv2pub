@@ -45,7 +45,7 @@ export function toSealCode(code: string): Hex {
 }
 
 /** What a leaf records. Values are fixed forever: changing one would break old proofs. */
-export const LeafKind = { seal: 1, proposal: 2, vote: 3, result: 4, set: 5, version: 6, draw: 7, certificate: 8, ledgerCheckpoint: 11, witnessChange: 12, memberVoice: 13, game: 14, beacon: 15, randomRequest: 16, beaconCommit: 17 } as const;
+export const LeafKind = { seal: 1, proposal: 2, vote: 3, result: 4, set: 5, version: 6, draw: 7, certificate: 8, ledgerCheckpoint: 11, witnessChange: 12, memberVoice: 13, game: 14, beacon: 15, randomRequest: 16, beaconCommit: 17, beaconSecret: 18 } as const;
 // Reserved, not yet in use: 9 agree-event, 10 evidence-package (docs/proof-receipt-design.md).
 export type LeafKind = (typeof LeafKind)[keyof typeof LeafKind];
 

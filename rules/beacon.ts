@@ -12,13 +12,21 @@ import { encodeAbiParameters, getAddress, keccak256, recoverMessageAddress, stri
  *   Ledger. The block that holds it is a request block.
  * - REVEAL. Witnesses that see a request block send their next reveal. The sequencer doesn't know
  *   them in advance, and a witness never sees what the number will be used with (a game's secret).
+ * - SECRET. The request block also carries a kind-18 record: the hash of a fresh sequencer secret.
+ *   Witnesses can't know the secret while they decide whether to reveal, so even a lone witness
+ *   can't work out which choice would help it. The sequencer fixed the secret before any reveal
+ *   existed, so it can't fit the secret to the reveals either.
  * - BEACON. A few seconds later the sequencer closes the request: the beacon value mixes the block
- *   hash with every reveal received, and a kind-15 record of it goes into a later block.
+ *   hash, the secret and every reveal received, and a kind-15 record of it goes into a later block.
  *
- * A witness checks its reveal made it in and raises an alert if it was left out.
+ * Every reveal the sequencer accepts gets a signed receipt. A witness checks its reveal made it in;
+ * if it was left out, the receipt proves it to anyone.
  */
 
 const BEACON_DOMAIN = keccak256(stringToBytes("VesTally Blockchain Ledger beacon v1"));
+/** v2 beacons also mix in the sequencer's sealed secret. v1 beacons (before it existed) still check. */
+const BEACON_DOMAIN_V2 = keccak256(stringToBytes("VesTally Blockchain Ledger beacon v2"));
+const SECRET_DOMAIN = keccak256(stringToBytes("VesTally Blockchain Ledger beacon secret v1"));
 /** Most reveals a witness can skip between two accepted ones (sent but lost, for example). */
 export const BEACON_MAX_GAP = 10_000;
 /** Reveals in a witness's chain: years of bingo nights. A new chain starts itself when one runs low. */
@@ -49,6 +57,8 @@ export interface Beacon {
   height: number;
   blockHash: Hex;
   reveals: BeaconReveal[];
+  /** The sequencer's secret, published when the beacon closes. Its hash is the request block's kind-18 record. Absent on v1 beacons. */
+  secret?: Hex;
   value: Hex;
 }
 
@@ -90,14 +100,52 @@ const sorted = (reveals: readonly Pick<BeaconReveal, "witness" | "index" | "valu
   [...reveals].sort((a, b) => (a.witness.toLowerCase() < b.witness.toLowerCase() ? -1 : 1));
 
 /** The beacon value for a request block. With no reveals it's still defined, but then only as unpredictable as the sequencer. */
-export function beaconValue(height: number, blockHash: Hex, reveals: readonly Pick<BeaconReveal, "witness" | "index" | "value">[]): Hex {
+export function beaconValue(height: number, blockHash: Hex, reveals: readonly Pick<BeaconReveal, "witness" | "index" | "value">[], secret?: Hex): Hex {
   const r = sorted(reveals);
+  const list = [r.map((x) => getAddress(x.witness)), r.map((x) => BigInt(x.index)), r.map((x) => x.value)] as const;
+  if (secret === undefined)
+    return keccak256(
+      encodeAbiParameters(
+        [{ type: "bytes32" }, { type: "uint64" }, { type: "bytes32" }, { type: "address[]" }, { type: "uint64[]" }, { type: "bytes32[]" }],
+        [BEACON_DOMAIN, BigInt(height), blockHash, ...list],
+      ),
+    );
   return keccak256(
     encodeAbiParameters(
-      [{ type: "bytes32" }, { type: "uint64" }, { type: "bytes32" }, { type: "address[]" }, { type: "uint64[]" }, { type: "bytes32[]" }],
-      [BEACON_DOMAIN, BigInt(height), blockHash, r.map((x) => getAddress(x.witness)), r.map((x) => BigInt(x.index)), r.map((x) => x.value)],
+      [{ type: "bytes32" }, { type: "uint64" }, { type: "bytes32" }, { type: "bytes32" }, { type: "address[]" }, { type: "uint64[]" }, { type: "bytes32[]" }],
+      [BEACON_DOMAIN_V2, BigInt(height), blockHash, secret, ...list],
     ),
   );
+}
+
+/** The kind-18 record in a request block: a commitment to the sequencer's secret for that block. */
+export function beaconSecretCommit(secret: Hex): Hex {
+  return keccak256(encodeAbiParameters([{ type: "bytes32" }, { type: "bytes32" }], [SECRET_DOMAIN, secret]));
+}
+
+/**
+ * Checks a beacon against its request block: a v2 beacon's secret must match the block's kind-18
+ * commitment, and a block that carries a commitment must have a v2 beacon (no dropping the secret).
+ */
+export function beaconMatchesBlock(b: Pick<Beacon, "secret" | "blockHash">, block: { hash: Hex; records: readonly { kind: number; value: Hex }[] }): string | null {
+  if (block.hash.toLowerCase() !== b.blockHash.toLowerCase()) return "The beacon names a different request block.";
+  const commits = block.records.filter((r) => r.kind === 18);
+  if (b.secret === undefined) return commits.length ? "The request block holds a sealed secret, but the beacon doesn't use it." : null;
+  if (commits.length !== 1) return "The request block doesn't hold exactly one sealed secret.";
+  return commits[0]!.value.toLowerCase() === beaconSecretCommit(b.secret).toLowerCase() ? null : "The beacon's secret doesn't match the one sealed in its request block.";
+}
+
+/** What the sequencer signs when it accepts a reveal. A witness holding one can prove its reveal was taken. */
+export const beaconReceiptMessage = (height: number, witness: Address, index: number, value: Hex) =>
+  `VesTally beacon reveal accepted\nBlock: ${height}\nWitness: ${getAddress(witness)}\nIndex: ${index}\nValue: ${value.toLowerCase()}`;
+
+/** Who signed a reveal receipt, or null. */
+export async function beaconReceiptSigner(r: { height: number; witness: Address; index: number; value: Hex; receipt: Hex }): Promise<Address | null> {
+  try {
+    return await recoverMessageAddress({ message: beaconReceiptMessage(r.height, r.witness, r.index, r.value), signature: r.receipt });
+  } catch {
+    return null;
+  }
 }
 
 /** The kind-15 record that puts a closed beacon on the Ledger. */
@@ -107,7 +155,7 @@ export function beaconRecordValue(b: Pick<Beacon, "height" | "value">): Hex {
 
 /** Checks a published beacon on its own: the value matches its reveals and every reveal links to the one before it. */
 export function checkBeacon(b: Beacon): string | null {
-  if (beaconValue(b.height, b.blockHash, b.reveals).toLowerCase() !== b.value.toLowerCase()) return `The beacon for block ${b.height} doesn't match its reveals.`;
+  if (beaconValue(b.height, b.blockHash, b.reveals, b.secret).toLowerCase() !== b.value.toLowerCase()) return `The beacon for block ${b.height} doesn't match its reveals.`;
   const seen = new Set<string>();
   for (const r of b.reveals) {
     if (seen.has(r.witness.toLowerCase())) return `Witness ${r.witness} appears twice in the beacon for block ${b.height}.`;

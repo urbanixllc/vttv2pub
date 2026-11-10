@@ -20,7 +20,15 @@
  * Randomness: when a block asks for a random number (a bingo ball, say), this witness adds the next
  * value from its own hash chain (witness-data/beacon.json, made automatically). Nobody else knows
  * that value in advance, so nobody, VesTally included, can see the number coming. It costs a few
- * bytes per request and a fraction of a second once at startup.
+ * bytes per request and a fraction of a second once at startup. Every contribution VesTally accepts
+ * comes with a signed receipt (kept in witness-data/receipts.jsonl): if it were ever left out, the
+ * receipt proves it to anyone.
+ *
+ * The daily anchor: about every ten minutes this witness reads VesTally's latest anchor transactions
+ * straight from BNB Chain (through a public node, not through VesTally) and checks that the anchored
+ * checkpoint is a block in its own copy. If VesTally ever showed this witness one history and
+ * anchored another, this is where it shows. Options: --bnb-rpc <url>, --anchor-contract <0x...>,
+ * --anchor-check off.
  */
 import { randomBytes } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
@@ -29,7 +37,7 @@ import { bytesToHex, concat, encodeAbiParameters, getAddress, keccak256, recover
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 
 /** Shown at startup; README and the Ledger page say which is current. */
-export const VERSION = "2026.11.10";
+export const VERSION = "2026.11.11";
 const KEY_FILE = "witness-key.json";
 const DATA = "witness-data";
 const GENESIS_PREV = `0x${"00".repeat(32)}`;
@@ -46,7 +54,12 @@ const pair = (a, b) => (a.toLowerCase() < b.toLowerCase() ? keccak256(concat([a,
 /** Merkle root: leaves sorted and de-duplicated; pairs hashed in sorted order; an odd node moves up unchanged. */
 export function recordsRoot(records) {
   if (!records.length) return EMPTY_ROOT;
-  let level = [...new Set(records.map((r) => leafOf(r).toLowerCase()))].sort();
+  return merkleRoot(records.map((r) => leafOf(r)));
+}
+
+/** The same tree over leaves already made (the daily anchor's manifest is a list of leaves). */
+export function merkleRoot(leaves) {
+  let level = [...new Set(leaves.map((l) => l.toLowerCase()))].sort();
   while (level.length > 1) {
     const next = [];
     for (let i = 0; i < level.length; i += 2) next.push(level[i + 1] ? pair(level[i], level[i + 1]) : level[i]);
@@ -81,6 +94,96 @@ export async function checkBlock(b, prev, sequencer) {
 
 // ---------- randomness: a hash chain (docs/vtt-ledger-design.md, "Randomness beacon") ----------
 const RANDOM_REQUEST = 16;
+const BEACON_SECRET = 18;
+const LEDGER_CHECKPOINT = 11;
+const BEACON_V1 = keccak256(stringToBytes("VesTally Blockchain Ledger beacon v1"));
+const BEACON_V2 = keccak256(stringToBytes("VesTally Blockchain Ledger beacon v2"));
+const SECRET_DOMAIN = keccak256(stringToBytes("VesTally Blockchain Ledger beacon secret v1"));
+/** Must match the site's beaconReceiptMessage exactly. */
+export const receiptMessage = (height, address, index, value) =>
+  `VesTally beacon reveal accepted\nBlock: ${height}\nWitness: ${getAddress(address)}\nIndex: ${index}\nValue: ${value.toLowerCase()}`;
+
+/** A closed beacon's value from its inputs: the request block's hash, the sealed secret (v2) and the reveals, sorted by witness. */
+export function beaconValue(b) {
+  const r = [...b.reveals].sort((x, y) => (x.witness.toLowerCase() < y.witness.toLowerCase() ? -1 : 1));
+  const list = [r.map((x) => getAddress(x.witness)), r.map((x) => BigInt(x.index)), r.map((x) => x.value)];
+  if (b.secret === undefined)
+    return keccak256(
+      encodeAbiParameters(
+        [{ type: "bytes32" }, { type: "uint64" }, { type: "bytes32" }, { type: "address[]" }, { type: "uint64[]" }, { type: "bytes32[]" }],
+        [BEACON_V1, BigInt(b.height), b.blockHash, ...list],
+      ),
+    );
+  return keccak256(
+    encodeAbiParameters(
+      [{ type: "bytes32" }, { type: "uint64" }, { type: "bytes32" }, { type: "bytes32" }, { type: "address[]" }, { type: "uint64[]" }, { type: "bytes32[]" }],
+      [BEACON_V2, BigInt(b.height), b.blockHash, b.secret, ...list],
+    ),
+  );
+}
+export const secretCommit = (secret) => keccak256(encodeAbiParameters([{ type: "bytes32" }, { type: "bytes32" }], [SECRET_DOMAIN, secret]));
+
+/** Checks a closed beacon against the request block this witness holds. Returns a problem, or null. */
+export function checkClosedBeacon(b, block) {
+  if (beaconValue(b).toLowerCase() !== b.value.toLowerCase()) return "its value doesn't follow from its inputs";
+  if (!block) return null;
+  if (block.hash.toLowerCase() !== b.blockHash.toLowerCase()) return "it names a different request block";
+  const commits = block.records.filter((r) => r.kind === BEACON_SECRET);
+  if (b.secret === undefined) return commits.length ? "it leaves out the secret sealed in its request block" : null;
+  if (commits.length !== 1 || commits[0].value.toLowerCase() !== secretCommit(b.secret).toLowerCase()) return "its secret isn't the one sealed in its request block";
+  return null;
+}
+
+// ---------- the daily anchor on BNB Chain ----------
+const ANCHORED_TOPIC = keccak256(stringToBytes("Anchored(address,bytes32,uint256,bytes32)"));
+export const DEFAULT_ANCHOR_CONTRACT = "0x89D8EB0A3A5144E1dbE269CDee6dD3BBad8EF3C0";
+export const DEFAULT_BNB_RPC = "https://bsc-dataseed.bnbchain.org";
+
+/** A transaction receipt, read from a BNB Chain node of your choosing (never through VesTally). */
+export async function rpcReceipt(rpc, txHash) {
+  const res = await fetch(rpc, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_getTransactionReceipt", params: [txHash] }),
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!res.ok) throw new Error(`BNB Chain node: HTTP ${res.status}`);
+  return (await res.json()).result ?? null;
+}
+
+/**
+ * One anchored batch against this witness's copy: the manifest rebuilds the root, the root is in an
+ * Anchored event of the pinned contract in that transaction on BNB Chain, and the batch's Ledger
+ * checkpoint (a kind-11 leaf of a block hash) is a block this witness holds.
+ * Returns { status: "ok", height } | { status: "later", why } | { status: "alert", why }.
+ */
+export function checkAnchor({ manifest, receipt, contract, blocks, recordedAt }) {
+  const leaves = [...new Set((manifest.leaves ?? []).map((l) => l.toLowerCase()))].sort();
+  if (!leaves.length || merkleRoot(leaves).toLowerCase() !== manifest.root.toLowerCase()) return { status: "alert", why: `anchor batch ${manifest.id}'s leaves don't rebuild its root` };
+  if (keccak256(concat(leaves)).toLowerCase() !== manifest.manifestDigest.toLowerCase()) return { status: "alert", why: `anchor batch ${manifest.id}'s leaves don't match its digest` };
+  if (!receipt) return { status: "later", why: `transaction ${manifest.txHash} isn't visible on this BNB Chain node yet` };
+  const onChain =
+    receipt.status === "0x1" &&
+    (receipt.logs ?? []).some(
+      (l) =>
+        l.address.toLowerCase() === contract.toLowerCase() &&
+        (l.topics[0] ?? "").toLowerCase() === ANCHORED_TOPIC.toLowerCase() &&
+        (l.topics[2] ?? "").toLowerCase() === manifest.root.toLowerCase(),
+    );
+  if (!onChain) return { status: "alert", why: `anchor batch ${manifest.id}'s root isn't in an Anchored event of ${contract} in transaction ${manifest.txHash}` };
+  const set = new Set(leaves);
+  const cutoff = recordedAt - 3 * 86_400_000;
+  for (let i = blocks.length - 1; i >= 0 && blocks[i].time >= cutoff; i--) {
+    const b = blocks[i];
+    if (b.time > recordedAt) continue;
+    if (set.has(leafOf({ kind: LEDGER_CHECKPOINT, value: b.hash }).toLowerCase())) return { status: "ok", height: b.height };
+  }
+  if (!blocks.length || blocks.at(-1).time < recordedAt) return { status: "later", why: "this copy hasn't reached the anchor's time yet" };
+  return {
+    status: "alert",
+    why: `the BNB Chain anchor in ${manifest.txHash} holds no checkpoint of any block in your copy. Either that anchor skipped its checkpoint, or VesTally anchored a different history from the one it showed you`,
+  };
+}
 const CHAIN_LENGTH = 100_000;
 /** Must match the site's beaconCommitMessage exactly. */
 const commitMessage = (address, top, length, time) => `VesTally beacon commitment\nWitness: ${getAddress(address)}\nTop: ${top.toLowerCase()}\nLength: ${length}\nTime: ${time}`;
@@ -228,12 +331,22 @@ async function run() {
     const index = chainState.next;
     chainState = { ...chainState, next: index + 1 };
     saveJson(chainFile, chainState); // used before it's sent, so a value is never sent twice
+    const value = chain.reveal(index);
     try {
-      await api(site, "beacon/reveals", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ height, witness: account.address, index, value: chain.reveal(index) }) });
-      sentReveals.push({ height, index, at: Date.now() });
+      const out = await api(site, "beacon/reveals", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ height, witness: account.address, index, value }) });
+      // VesTally's signed receipt for exactly this contribution: kept on disk as proof.
+      const who = out?.receipt ? await recoverMessageAddress({ message: receiptMessage(height, account.address, index, value), signature: out.receipt }).catch(() => null) : null;
+      const receipt = who && who.toLowerCase() === sequencer.toLowerCase() ? out.receipt : null;
+      if (receipt) appendFileSync(join(DATA, "receipts.jsonl"), JSON.stringify({ height, witness: account.address, index, value, receipt }) + "\n");
+      else console.error(`ALERT: VesTally took your random contribution for block ${height} without a valid signed receipt.`);
+      sentReveals.push({ height, index, value, receipt, at: Date.now() });
     } catch (e) {
       if (/no-commitment|bad-reveal/.test(e.message)) { committed = false; lastCommitTry = 0; }
-      if (!/409/.test(e.message)) console.warn(`  random contribution for block ${height} not accepted (${e.message}).`);
+      const block = blocks.find((b) => b.height === height);
+      // Turned away as "closed" well inside the 6-second window: an on-time contribution was refused.
+      if (/"closed"/.test(e.message) && block && Date.now() - block.time < 4_000)
+        console.error(`ALERT: VesTally turned away your on-time random contribution for block ${height} (a VesTally restart can also do this). Keep this log.`);
+      else if (!/409/.test(e.message)) console.warn(`  random contribution for block ${height} not accepted (${e.message}).`);
     }
   };
   // A contribution the site accepted must show up in that block's random number.
@@ -242,8 +355,46 @@ async function run() {
       const b = await api(site, `beacon/${x.height}`).catch((e) => (/404/.test(e.message) ? null : undefined));
       if (b === undefined || (b && !b.final)) continue;
       sentReveals.splice(sentReveals.indexOf(x), 1);
-      if (!b?.reveals?.some((r) => r.witness.toLowerCase() === account.address.toLowerCase() && r.index === x.index))
-        console.error(`ALERT: VesTally accepted your random contribution for block ${x.height} but left it out. Keep this log and tell the community.`);
+      if (!b?.reveals?.some((r) => r.witness.toLowerCase() === account.address.toLowerCase() && r.index === x.index)) {
+        const proof = x.receipt ? ` VesTally's signed receipt proves it: ${JSON.stringify({ height: x.height, witness: account.address, index: x.index, value: x.value, receipt: x.receipt })}` : "";
+        console.error(`ALERT: VesTally accepted your random contribution for block ${x.height} but left it out. Keep this log and tell the community.${proof}`);
+        continue;
+      }
+      const why = checkClosedBeacon(b, blocks.find((y) => y.height === x.height));
+      if (why) console.error(`ALERT: the random number for block ${x.height} doesn't check out: ${why}. Keep this log and tell the community.`);
+    }
+  };
+
+  // The daily anchor, read from BNB Chain directly: is its checkpoint a block in this copy?
+  const anchorCheck = (arg("anchor-check") ?? process.env.WITNESS_ANCHOR_CHECK ?? "on") !== "off";
+  const bnbRpc = arg("bnb-rpc") ?? process.env.WITNESS_BNB_RPC ?? DEFAULT_BNB_RPC;
+  const anchorContract = arg("anchor-contract") ?? process.env.WITNESS_ANCHOR_CONTRACT ?? DEFAULT_ANCHOR_CONTRACT;
+  const anchorsFile = join(DATA, "anchors.json");
+  const anchorsDone = new Set(existsSync(anchorsFile) ? JSON.parse(readFileSync(anchorsFile, "utf8")) : []);
+  let lastAnchorCheck = 0;
+  const siteBase = site.replace(/\/$/, "");
+  const checkAnchors = async () => {
+    if (!anchorCheck || Date.now() - lastAnchorCheck < 600_000) return;
+    lastAnchorCheck = Date.now();
+    try {
+      const res = await fetch(`${siteBase}/api/anchors`, { signal: AbortSignal.timeout(15_000) });
+      if (!res.ok) return;
+      const { batches = [] } = await res.json();
+      for (const batch of batches.slice(0, 5).reverse()) {
+        if (anchorsDone.has(batch.id) || !batch.txHash || !batch.recordedAt) continue;
+        const m = await fetch(`${siteBase}/api/anchors/${batch.id}/manifest`, { signal: AbortSignal.timeout(15_000) });
+        if (!m.ok) continue;
+        const manifest = await m.json();
+        const receipt = await rpcReceipt(bnbRpc, manifest.txHash);
+        const result = checkAnchor({ manifest, receipt, contract: anchorContract, blocks, recordedAt: Date.parse(batch.recordedAt) });
+        if (result.status === "later") continue;
+        anchorsDone.add(batch.id);
+        saveJson(anchorsFile, [...anchorsDone]);
+        if (result.status === "ok") console.log(`BNB Chain anchor ${manifest.txHash.slice(0, 12)}... confirms your copy up to block #${result.height}.`);
+        else console.error(`ALERT: ${result.why}. Keep ${file} as evidence and tell the community.`);
+      }
+    } catch (e) {
+      console.warn(`  couldn't check the daily anchor (${e.message}); will retry.`);
     }
   };
 
@@ -288,6 +439,7 @@ async function run() {
         await ensureCommit();
         await checkReveals();
       }
+      await checkAnchors();
       // Just approved: vouch for the copy we already checked.
       if (approved && backlog < blocks.length) {
         const n = blocks.length - backlog;

@@ -5,6 +5,16 @@ VesTally ever served a rewritten history, your witness would refuse to sign and 
 Witnesses also add the randomness behind fair games such as charity bingo (see
 [Random numbers](#random-numbers)).
 
+About every ten minutes it also reads VesTally's latest anchor transactions straight from BNB
+Chain, through a public node and not through VesTally, and checks that the anchored checkpoint is a
+block in its own copy. If VesTally ever showed your witness one history and anchored another, it
+says so. To use a different BNB Chain node add `--bnb-rpc <url>` (or `WITNESS_BNB_RPC`); to switch
+the check off, `--anchor-check off`.
+
+Every random-number contribution VesTally accepts comes back with a signed receipt, kept in
+`witness-data/receipts.jsonl`. If one were ever left out, your witness prints an alert with the
+receipt, which proves it to anyone.
+
 It's a small program: about 25 MB of memory and almost no CPU. If your computer is off, it catches
 up when it's back; the Ledger never waits for you.
 
@@ -194,7 +204,7 @@ folder.
 ## Which version am I running?
 
 The first line the witness prints, and its log after every restart, shows its version, such as
-`VesTally witness 2026.11.10`. Or run `node witness.mjs version`. The newest version is the one in
+`VesTally witness 2026.11.11`. Or run `node witness.mjs version`. The newest version is the one in
 this repository. Updating keeps your key, your copy of the Ledger and your randomness chain.
 
 ## Random numbers
