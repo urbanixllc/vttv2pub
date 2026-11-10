@@ -16,10 +16,16 @@
  * date, and once approved it co-signs everything it holds. Your key never leaves this computer.
  * This is an independent implementation of the block rules (it doesn't use VesTally's own code),
  * which is a check in itself.
+ *
+ * Randomness: when a block asks for a random number (a bingo ball, say), this witness adds the next
+ * value from its own hash chain (witness-data/beacon.json, made automatically). Nobody else knows
+ * that value in advance, so nobody, VesTally included, can see the number coming. It costs a few
+ * bytes per request and a fraction of a second once at startup.
  */
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { concat, encodeAbiParameters, getAddress, keccak256, recoverMessageAddress, stringToBytes } from "viem";
+import { bytesToHex, concat, encodeAbiParameters, getAddress, keccak256, recoverMessageAddress, stringToBytes } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 
 const KEY_FILE = "witness-key.json";
@@ -69,6 +75,39 @@ export async function checkBlock(b, prev, sequencer) {
   const who = await recoverMessageAddress({ message: { raw: b.hash }, signature: b.sequencerSig }).catch(() => null);
   if (!who || who.toLowerCase() !== sequencer.toLowerCase()) return `block ${b.height} isn't signed by the sequencer`;
   return null;
+}
+
+// ---------- randomness: a hash chain (docs/vtt-ledger-design.md, "Randomness beacon") ----------
+const RANDOM_REQUEST = 16;
+const CHAIN_LENGTH = 100_000;
+/** Must match the site's beaconCommitMessage exactly. */
+const commitMessage = (address, top, length, time) => `VesTally beacon commitment\nWitness: ${getAddress(address)}\nTop: ${top.toLowerCase()}\nLength: ${length}\nTime: ${time}`;
+
+/**
+ * s0 = secret, s(k+1) = keccak(s(k)); the top s(N) is published. Reveal i is s(N - i), so each reveal
+ * hashes to the previous one. Checkpoints every 1,000 steps keep each reveal quick.
+ */
+export function makeChain(secret, length) {
+  const checkpoints = [];
+  let v = secret;
+  for (let k = 0; k < length; k++) {
+    if (k % 1000 === 0) checkpoints.push(v);
+    v = keccak256(v);
+  }
+  return {
+    top: v,
+    reveal(i) {
+      const k = length - i;
+      let x = checkpoints[Math.floor(k / 1000)];
+      for (let j = 0; j < k % 1000; j++) x = keccak256(x);
+      return x;
+    },
+  };
+}
+
+function saveJson(path, value) {
+  writeFileSync(`${path}.tmp`, JSON.stringify(value));
+  renameSync(`${path}.tmp`, path);
 }
 
 // ---------- running ----------
@@ -143,6 +182,67 @@ async function run() {
   }
   console.log(`Witness ${account.address}. Holding ${blocks.length} block(s). Watching ${site}.`);
 
+  // The randomness chain: made once, replaced by itself when nearly used up or if the file is lost.
+  const chainFile = join(DATA, "beacon.json");
+  let chainState = null;
+  let chain = null;
+  const loadChain = () => {
+    if (!chainState && existsSync(chainFile)) {
+      try { chainState = JSON.parse(readFileSync(chainFile, "utf8")); } catch { chainState = null; }
+    }
+    if (!chainState || chainState.next > chainState.length - 10) {
+      chainState = { secret: bytesToHex(randomBytes(32)), length: CHAIN_LENGTH, time: Date.now(), next: 1 };
+      saveJson(chainFile, chainState);
+      chain = null;
+      committed = false;
+    }
+    chain ??= makeChain(chainState.secret, chainState.length);
+  };
+  let committed = false;
+  let lastCommitTry = 0;
+  let lastRequest = 0;
+  const sentReveals = [];
+  const ensureCommit = async () => {
+    loadChain();
+    if (committed || Date.now() - lastCommitTry < 60_000) return;
+    lastCommitTry = Date.now();
+    try {
+      const status = await api(site, "beacon");
+      const mine = status.witnesses?.find((w) => w.witness.toLowerCase() === account.address.toLowerCase());
+      if (mine && mine.top.toLowerCase() === chain.top.toLowerCase()) { committed = true; return; }
+      const signature = await account.signMessage({ message: commitMessage(account.address, chain.top, chainState.length, chainState.time) });
+      await api(site, "beacon/commits", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ witness: account.address, top: chain.top, length: chainState.length, time: chainState.time, signature }) });
+      committed = true;
+      console.log("Randomness: your chain is published. You'll add to random numbers when the site asks for them.");
+    } catch (e) {
+      console.warn(`  randomness chain not published yet (${e.message}); will retry.`);
+    }
+  };
+  const reveal = async (height) => {
+    if (!committed) return;
+    loadChain();
+    const index = chainState.next;
+    chainState = { ...chainState, next: index + 1 };
+    saveJson(chainFile, chainState); // used before it's sent, so a value is never sent twice
+    try {
+      await api(site, "beacon/reveals", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ height, witness: account.address, index, value: chain.reveal(index) }) });
+      sentReveals.push({ height, index, at: Date.now() });
+    } catch (e) {
+      if (/no-commitment|bad-reveal/.test(e.message)) { committed = false; lastCommitTry = 0; }
+      if (!/409/.test(e.message)) console.warn(`  random contribution for block ${height} not accepted (${e.message}).`);
+    }
+  };
+  // A contribution the site accepted must show up in that block's random number.
+  const checkReveals = async () => {
+    for (const x of sentReveals.filter((r) => Date.now() - r.at > 10_000)) {
+      const b = await api(site, `beacon/${x.height}`).catch((e) => (/404/.test(e.message) ? null : undefined));
+      if (b === undefined || (b && !b.final)) continue;
+      sentReveals.splice(sentReveals.indexOf(x), 1);
+      if (!b?.reveals?.some((r) => r.witness.toLowerCase() === account.address.toLowerCase() && r.index === x.index))
+        console.error(`ALERT: VesTally accepted your random contribution for block ${x.height} but left it out. Keep this log and tell the community.`);
+    }
+  };
+
   // Are we on the witness list? If not, ask to join (once), then keep checking.
   let approved = false;
   let lastCheck = 0;
@@ -180,6 +280,10 @@ async function run() {
         }
       }
       if (!approved && Date.now() - lastCheck > 60_000) await checkApproval();
+      if (approved) {
+        await ensureCommit();
+        await checkReveals();
+      }
       // Just approved: vouch for the copy we already checked.
       if (approved && backlog < blocks.length) {
         const n = blocks.length - backlog;
@@ -213,6 +317,11 @@ async function run() {
             });
             signed++;
             backlog = blocks.length;
+            // A live request for a random number: add ours. Old ones (when catching up) are skipped.
+            if (b.records.some((r) => r.kind === RANDOM_REQUEST) && b.time > Date.now() - 60_000) {
+              lastRequest = Date.now();
+              await reveal(b.height);
+            }
           }
           next = b.height + 1;
         }
@@ -222,7 +331,8 @@ async function run() {
     } catch (e) {
       console.warn(`${new Date().toISOString()}  ${e.message}; retrying`);
     }
-    await new Promise((r) => setTimeout(r, 3_000));
+    // Every 3 seconds; every second for two minutes after a random-number request (a game is on).
+    await new Promise((r) => setTimeout(r, Date.now() - lastRequest < 120_000 ? 1_000 : 3_000));
   }
 }
 
