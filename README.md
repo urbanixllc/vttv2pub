@@ -24,6 +24,10 @@ Get the proof file from the seal's check page once the seal is recorded ("Batch 
 the time of the block it was recorded in. It says nothing about who made the file or whether its
 content is true.
 
+The record contract is open to anyone, so the verifier also checks the root was published by
+VesTally's relayer (built in for BNB Chain). A root someone anchored themselves fails. On a test
+chain, name the relayer with `--submitter <address>`.
+
 ## Run a witness
 
 See [witness/README.md](witness/README.md).

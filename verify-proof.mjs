@@ -2,7 +2,7 @@
 /**
  * VesTally independent proof verifier. One file, no dependencies, no VesTally servers.
  *
- *   node verify-proof.mjs <proof.json> [file-to-check] [--rpc <url>]
+ *   node verify-proof.mjs <proof.json> [file-to-check] [--rpc <url>] [--submitter <address>]
  *
  * It checks a VesTally proof file (downloaded from a check page) against your copy of the file and
  * against the chain itself, through any public RPC you choose. Everything it does is written out
@@ -16,7 +16,10 @@
  *  4. Over RPC: the chain ID matches; the transaction succeeded; it contains the event
  *     Anchored(address indexed submitter, bytes32 indexed root, uint256 count, bytes32 manifestDigest)
  *     from the proof's contract, with this root.
- *  5. The recorded time is the timestamp of that transaction's block, read from the chain.
+ *  5. The event's submitter is VesTally's relayer. RecordAnchor lets anyone publish a root, so a
+ *     root someone anchored themselves must not pass as recorded by VesTally. On BNB Chain the
+ *     relayer below is pinned; on other chains pass --submitter <address>.
+ *  6. The recorded time is the timestamp of that transaction's block, read from the chain.
  *
  * What a pass means: this exact file (or code) was in a batch recorded on that chain by that block's
  * time. It does not show who made the file or that anything in it is true.
@@ -91,6 +94,11 @@ export function walkProof(leaf, proof) {
   return h;
 }
 
+/** VesTally's published records on BNB Chain (chain 56): the RecordAnchor contract and the relayer that calls it. */
+export const VESTALLY_ANCHORS = {
+  56: { contract: "0x89d8eb0a3a5144e1dbe269cdee6dd3bbad8ef3c0", submitter: "0xcdd05bb4ec7dfe5f981a0a89a80ca505452c5408" },
+};
+
 const ANCHORED_TOPIC = hex(keccak256(new TextEncoder().encode("Anchored(address,bytes32,uint256,bytes32)")));
 
 async function rpc(url, method, params) {
@@ -101,7 +109,7 @@ async function rpc(url, method, params) {
 }
 
 /** Returns a list of [ok, message] lines. Exported for tests. */
-export async function verify(proofFile, fileBytes, rpcUrl) {
+export async function verify(proofFile, fileBytes, rpcUrl, opts = {}) {
   const p = proofFile;
   const out = [];
   const check = (ok, msg) => (out.push([ok, msg]), ok);
@@ -129,10 +137,21 @@ export async function verify(proofFile, fileBytes, rpcUrl) {
   if (!check(receipt.status === "0x1", receipt.status === "0x1" ? "The transaction succeeded." : "The transaction failed.")) return out;
   const log = receipt.logs.find((l) => l.address.toLowerCase() === String(p.contract).toLowerCase() && l.topics[0]?.toLowerCase() === ANCHORED_TOPIC && l.topics[2]?.toLowerCase() === p.root.toLowerCase());
   if (!check(Boolean(log), log ? `The transaction published this root from contract ${p.contract}.` : "The transaction doesn't publish this root from the proof's contract.")) return out;
-  const submitter = "0x" + log.topics[1].slice(26);
+  const submitter = ("0x" + log.topics[1].slice(26)).toLowerCase();
+  const expected = (opts.submitter ?? VESTALLY_ANCHORS[chainId]?.submitter ?? "").toLowerCase();
+  if (!expected) {
+    check(false, `Published by ${submitter}, but no VesTally relayer is known for chain ${chainId}. Pass --submitter <address> to confirm who recorded it.`);
+    return out;
+  }
+  const pinned = VESTALLY_ANCHORS[chainId];
+  if (pinned && !opts.submitter && String(p.contract).toLowerCase() !== pinned.contract) {
+    check(false, `The proof names contract ${p.contract}, not VesTally's RecordAnchor (${pinned.contract}).`);
+    return out;
+  }
+  if (!check(submitter === expected, submitter === expected ? `Published by VesTally's relayer (${submitter}).` : `Published by ${submitter}, not VesTally's relayer (${expected}). Anyone can publish a root to this contract, so this is not a VesTally record.`)) return out;
   const block = await rpc(rpcUrl, "eth_getBlockByNumber", [receipt.blockNumber, false]);
   const at = new Date(Number(block.timestamp) * 1000);
-  check(true, `Recorded in block ${Number(receipt.blockNumber)} at ${at.toISOString()} (the chain's own time), by ${submitter}.`);
+  check(true, `Recorded in block ${Number(receipt.blockNumber)} at ${at.toISOString()} (the chain's own time).`);
   return out;
 }
 
@@ -141,12 +160,14 @@ if (process.argv[1] && import.meta.url.endsWith(process.argv[1].replace(/\\/g, "
   const args = process.argv.slice(2);
   const i = args.indexOf("--rpc");
   const rpcUrl = i >= 0 ? args.splice(i, 2)[1] : process.env.RPC_URL;
+  const j = args.indexOf("--submitter");
+  const submitter = j >= 0 ? args.splice(j, 2)[1] : undefined;
   const [proofPath, filePath] = args;
   if (!proofPath) {
     console.log("Usage: node verify-proof.mjs <proof.json> [file] --rpc <url>   (BSC: https://bsc-rpc.publicnode.com)");
     process.exit(2);
   }
-  const lines = await verify(JSON.parse(readFileSync(proofPath, "utf8")), filePath ? readFileSync(filePath) : null, rpcUrl).catch((e) => [[false, e.message]]);
+  const lines = await verify(JSON.parse(readFileSync(proofPath, "utf8")), filePath ? readFileSync(filePath) : null, rpcUrl, { submitter }).catch((e) => [[false, e.message]]);
   for (const [ok, msg] of lines) console.log(`${ok ? "✓" : "✗"} ${msg}`);
   const pass = lines.every(([ok]) => ok);
   console.log(pass ? "\nVERIFIED. This shows the file is unchanged and existed by that time, not who made it or that it's true." : "\nNOT VERIFIED.");
