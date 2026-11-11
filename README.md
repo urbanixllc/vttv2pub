@@ -31,6 +31,13 @@ The record contract is open to anyone, so the verifier also checks the root was 
 VesTally's relayer (built in for BNB Chain). A root someone anchored themselves fails. On a test
 chain, name the relayer with `--submitter <address>`.
 
+## Read records from your own systems
+
+The read-only Trust API serves the same records, receipts, random numbers and anchors these tools
+check: `https://vestallytoken.io/api/v1` (no key needed; description at
+`https://vestallytoken.io/api/v1/openapi.json`). Don't trust its answers: check them with the tools
+here.
+
 ## Check a business receipt
 
 See [verify-receipt/README.md](verify-receipt/README.md).
